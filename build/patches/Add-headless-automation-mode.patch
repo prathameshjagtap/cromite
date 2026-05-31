@@ -1,0 +1,433 @@
+From: Cromite <cromite@cromite.org>
+Date: Sat, 31 May 2026 00:00:00 +0000
+Subject: Add headless automation mode
+
+Adds an Android "headless / show-on-demand" automation mode driven by the
+existing cromite test-support DevTools socket (WebDriverIO + Appium).
+
+When the "headless-automation-mode" cromite flag is enabled, an opaque
+overlay can be placed on top of the web contents so the rendered page is
+hidden from the user while the renderer keeps running (so JavaScript and
+automation continue to work). The overlay is toggled on demand from the
+existing window.cromite private API:
+
+    await window.cromite.setContentVisible(false); // hide
+    await window.cromite.setContentVisible(true);  // show
+    await window.cromite.isContentVisible();        // query
+
+The visibility methods are exposed on chrome://version, exactly like the
+other window.cromite test APIs, and reach the Android view layer through a
+small JNI bridge that operates on the WebContents container view (no
+ChromeActivity coupling). Hiding uses an opaque Android View placed above
+the compositor surface rather than detaching the surface, so compositing
+is not suspended.
+
+This patch builds on Add-cromite-test-support.patch (it extends the
+CromitePrivateApiExtension mojo interface, the browser-process host and
+the renderer binding it introduces) and must be applied after it.
+
+Build note: the new Java class CromiteHeadlessBridge must be registered
+with the chrome generate_jni target in the build environment so that
+chrome/browser can include CromiteHeadlessBridge_jni.h. The exact
+generate_jni "sources" list in the targeted Chromium version is added
+there, not in this patch.
+
+License: GPL-3.0-only - https://spdx.org/licenses/GPL-3.0-only.html
+---
+ chrome/common/cromite_private_api_extension.mojom                       |  2 +
+ chrome/browser/cromite/cromite_private_api_host.h                       |  2 +
+ chrome/browser/cromite/cromite_private_api_host.cc                      | 30 +++
+ chrome/renderer/cromite/cromite_private_api_extension.h                 |  4 +
+ chrome/renderer/cromite/cromite_private_api_extension.cc                | 74 ++++++++
+ chrome/android/java/res/xml/developer_preferences.xml                   |  6 +
+ .../chrome/browser/headless/CromiteHeadlessBridge.java                  | 108 +++++++++++
+ .../chrome/browser/flags/cromite/sHeadlessAutomationMode.java           | 33 ++++
+ .../about_flags_cc/Headless-automation-mode.inc                         | 13 ++
+ .../content_features_cc/Headless-automation-mode.inc                    |  3 +
+ .../content_features_h/Headless-automation-mode.inc                     |  1 +
+ 11 files changed, 276 insertions(+)
+
+diff --git a/chrome/common/cromite_private_api_extension.mojom b/chrome/common/cromite_private_api_extension.mojom
+--- a/chrome/common/cromite_private_api_extension.mojom
++++ b/chrome/common/cromite_private_api_extension.mojom
+@@ -3,5 +3,7 @@ module chrome.mojom;
+ interface CromitePrivateApiExtension {
+   GetComponentData(string id) => (string response);
+   StartComponentUpdate(string id);
+   SetEnableLogConsole(bool enabled);
++  SetContentVisible(bool visible);
++  IsContentVisible() => (bool visible);
+ };
+diff --git a/chrome/browser/cromite/cromite_private_api_host.h b/chrome/browser/cromite/cromite_private_api_host.h
+--- a/chrome/browser/cromite/cromite_private_api_host.h
++++ b/chrome/browser/cromite/cromite_private_api_host.h
+@@ -35,7 +35,9 @@ class CromitePrivateApiHost
+   // chrome::mojom::CromitePrivateApiExtension:
+   void GetComponentData(const std::string& id,
+                         GetComponentDataCallback callback) override;
+   void StartComponentUpdate(const std::string& id) override;
+   void SetEnableLogConsole(bool can_show) override;
++  void SetContentVisible(bool visible) override;
++  void IsContentVisible(IsContentVisibleCallback callback) override;
+ 
+  private:
+diff --git a/chrome/browser/cromite/cromite_private_api_host.cc b/chrome/browser/cromite/cromite_private_api_host.cc
+--- a/chrome/browser/cromite/cromite_private_api_host.cc
++++ b/chrome/browser/cromite/cromite_private_api_host.cc
+@@ -1,13 +1,17 @@
+ #include "chrome/browser/cromite/cromite_private_api_host.h"
+ 
+ #include "base/json/json_writer.h"
+ 
++#include "base/android/jni_android.h"
++#include "base/android/scoped_java_ref.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/android/chrome_jni_headers/CromiteHeadlessBridge_jni.h"
+ #include "components/component_updater/component_updater_service.h"
+ #include "components/update_client/crx_update_item.h"
+ #include "content/public/browser/document_user_data.h"
+ #include "content/public/browser/navigation_handle.h"
+ #include "content/public/browser/render_frame_host.h"
+ #include "content/public/browser/site_instance.h"
++#include "content/public/browser/web_contents.h"
+ 
+ CromitePrivateApiHost::CromitePrivateApiHost(
+@@ -45,5 +49,31 @@ void CromitePrivateApiHost::SetEnableLogConsole(bool enabled) {
+   enable_log_console_ = enabled;
+ }
+ 
++void CromitePrivateApiHost::SetContentVisible(bool visible) {
++  content::WebContents* web_contents =
++      content::WebContents::FromRenderFrameHost(&render_frame_host());
++  if (!web_contents)
++    return;
++
++  JNIEnv* env = base::android::AttachCurrentThread();
++  Java_CromiteHeadlessBridge_setContentVisible(
++      env, web_contents->GetJavaWebContents(), visible);
++}
++
++void CromitePrivateApiHost::IsContentVisible(
++    IsContentVisibleCallback callback) {
++  content::WebContents* web_contents =
++      content::WebContents::FromRenderFrameHost(&render_frame_host());
++  if (!web_contents) {
++    std::move(callback).Run(true);
++    return;
++  }
++
++  JNIEnv* env = base::android::AttachCurrentThread();
++  bool visible = Java_CromiteHeadlessBridge_isContentVisible(
++      env, web_contents->GetJavaWebContents());
++  std::move(callback).Run(visible);
++}
++
+ // static
+ void CromitePrivateApiHost::BindHost(
+diff --git a/chrome/renderer/cromite/cromite_private_api_extension.h b/chrome/renderer/cromite/cromite_private_api_extension.h
+--- a/chrome/renderer/cromite/cromite_private_api_extension.h
++++ b/chrome/renderer/cromite/cromite_private_api_extension.h
+@@ -49,5 +49,9 @@ class CromitePrivateApiExtension : public content::RenderFrameObserver {
+   void StartComponentUpdate(gin::Arguments* args);
+   void SetEnableLogConsole(gin::Arguments* args);
++  void SetContentVisible(gin::Arguments* args);
++  void IsContentVisible(gin::Arguments* args);
++  void OnIsContentVisible(const base::UnguessableToken callback_id,
++                          bool visible);
+ 
+   std::map<const base::UnguessableToken,
+            std::unique_ptr<PendingRequest>> pending_requests_;
+diff --git a/chrome/renderer/cromite/cromite_private_api_extension.cc b/chrome/renderer/cromite/cromite_private_api_extension.cc
+--- a/chrome/renderer/cromite/cromite_private_api_extension.cc
++++ b/chrome/renderer/cromite/cromite_private_api_extension.cc
+@@ -56,10 +56,32 @@ void CromitePrivateApiExtension::InjectScript() {
+           gin::CreateFunctionTemplate(
+               isolate, base::BindRepeating(
+                            &CromitePrivateApiExtension::SetEnableLogConsole,
+                            weak_ptr_factory_.GetWeakPtr()))
+               ->GetFunction(context)
+               .ToLocalChecked())
+       .Check();
++
++  oCromiteObject
++      ->Set(
++          context, gin::StringToSymbol(isolate, "setContentVisible"),
++          gin::CreateFunctionTemplate(
++              isolate, base::BindRepeating(
++                           &CromitePrivateApiExtension::SetContentVisible,
++                           weak_ptr_factory_.GetWeakPtr()))
++              ->GetFunction(context)
++              .ToLocalChecked())
++      .Check();
++
++  oCromiteObject
++      ->Set(
++          context, gin::StringToSymbol(isolate, "isContentVisible"),
++          gin::CreateFunctionTemplate(
++              isolate, base::BindRepeating(
++                           &CromitePrivateApiExtension::IsContentVisible,
++                           weak_ptr_factory_.GetWeakPtr()))
++              ->GetFunction(context)
++              .ToLocalChecked())
++      .Check();
+ }
+ 
+ void CromitePrivateApiExtension::GetComponentData(gin::Arguments* args) {
+@@ -201,2 +223,54 @@ void CromitePrivateApiExtension::SetEnableLogConsole(gin::Arguments* args) {
+   remote_->SetEnableLogConsole(enabled);
+ }
++
++void CromitePrivateApiExtension::SetContentVisible(gin::Arguments* args) {
++  bool visible;
++  if (!args->GetNext(&visible)) {
++    args->ThrowError();
++    return;
++  }
++
++  if (!remote_.is_bound()) {
++    render_frame()->GetRemoteAssociatedInterfaces()->GetInterface(&remote_);
++  }
++
++  remote_->SetContentVisible(visible);
++}
++
++void CromitePrivateApiExtension::IsContentVisible(gin::Arguments* args) {
++  v8::Isolate* isolate = args->isolate();
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  v8::Local<v8::Promise::Resolver> resolver =
++      v8::Promise::Resolver::New(context).ToLocalChecked();
++
++  base::UnguessableToken callback_id = base::UnguessableToken::Create();
++  pending_requests_[callback_id] =
++      std::make_unique<PendingRequest>(isolate, context, resolver);
++
++  if (!remote_.is_bound()) {
++    render_frame()->GetRemoteAssociatedInterfaces()->GetInterface(&remote_);
++  }
++
++  remote_->IsContentVisible(
++      base::BindOnce(&CromitePrivateApiExtension::OnIsContentVisible,
++                     weak_ptr_factory_.GetWeakPtr(), callback_id));
++
++  args->Return(resolver->GetPromise());
++}
++
++void CromitePrivateApiExtension::OnIsContentVisible(
++    const base::UnguessableToken callback_id, bool visible) {
++  auto it = pending_requests_.find(callback_id);
++  if (it == pending_requests_.end())
++    return;
++  std::unique_ptr<PendingRequest> request = std::move(it->second);
++  pending_requests_.erase(it);
++
++  v8::Isolate* isolate = request->isolate;
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = request->context.Get(isolate);
++  v8::Context::Scope context_scope(context);
++  v8::Local<v8::Promise::Resolver> resolver =
++      request->promise_resolver.Get(isolate);
++  resolver->Resolve(context, v8::Boolean::New(isolate, visible)).Check();
++}
+diff --git a/chrome/android/java/res/xml/developer_preferences.xml b/chrome/android/java/res/xml/developer_preferences.xml
+--- a/chrome/android/java/res/xml/developer_preferences.xml
++++ b/chrome/android/java/res/xml/developer_preferences.xml
+@@ -19,9 +19,15 @@ found in the LICENSE file.
+     <org.chromium.components.browser_ui.settings.ChromeSwitchPreference
+         android:key="act_as_webview"
+         android:title="Enable webview support for cromite test"
+         android:summary="Setting allows the activation of specific APIs used for cromite testing. Do not activate if you do not know what you are doing."
+         app:featureName="act-as-webview"
+         app:needRestart="true" />
++    <org.chromium.components.browser_ui.settings.ChromeSwitchPreference
++        android:key="headless_automation_mode"
++        android:title="Headless automation mode"
++        android:summary="Hides web contents until revealed via window.cromite.setContentVisible(true). Do not activate if you do not know what you are doing."
++        app:featureName="headless-automation-mode"
++        app:needRestart="true" />
+     <Preference
+         android:key="test_gwp_asan"
+         android:title="Test Gwp Asan"/>
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/headless/CromiteHeadlessBridge.java b/chrome/android/java/src/org/chromium/chrome/browser/headless/CromiteHeadlessBridge.java
+new file mode 100644
+--- /dev/null
++++ b/chrome/android/java/src/org/chromium/chrome/browser/headless/CromiteHeadlessBridge.java
+@@ -0,0 +1,108 @@
++/*
++    This file is part of Cromite.
++
++    Cromite is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    Cromite is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with Cromite. If not, see <https://www.gnu.org/licenses/>.
++*/
++
++package org.chromium.chrome.browser.headless;
++
++import android.graphics.Color;
++import android.view.View;
++import android.view.ViewGroup;
++
++import org.jni_zero.CalledByNative;
++
++import org.chromium.base.ThreadUtils;
++import org.chromium.chrome.browser.flags.cromite.sHeadlessAutomationMode;
++import org.chromium.content_public.browser.WebContents;
++import org.chromium.ui.base.ViewAndroidDelegate;
++
++/**
++ * Bridges the window.cromite.setContentVisible / isContentVisible private API
++ * to an opaque overlay placed on top of the WebContents container view. The
++ * renderer keeps compositing while hidden, so automation continues to work.
++ */
++public class CromiteHeadlessBridge {
++    /** Opaque marker view so we can find our overlay among the children. */
++    private static class HeadlessOverlay extends View {
++        HeadlessOverlay(android.content.Context context) {
++            super(context);
++            setBackgroundColor(Color.BLACK);
++            // Automation input is injected through the renderer, not Android
++            // hit-testing, so the overlay does not need to be click-through.
++            setClickable(false);
++            setFocusable(false);
++        }
++    }
++
++    private CromiteHeadlessBridge() {}
++
++    @CalledByNative
++    private static void setContentVisible(WebContents webContents, boolean visible) {
++        ThreadUtils.runOnUiThread(() -> applyVisibility(webContents, visible));
++    }
++
++    @CalledByNative
++    private static boolean isContentVisible(WebContents webContents) {
++        HeadlessOverlay overlay = findOverlay(webContents);
++        return overlay == null || overlay.getVisibility() != View.VISIBLE;
++    }
++
++    private static ViewGroup getContainer(WebContents webContents) {
++        if (webContents == null) return null;
++        ViewAndroidDelegate delegate = webContents.getViewAndroidDelegate();
++        if (delegate == null) return null;
++        View container = delegate.getContainerView();
++        return (container instanceof ViewGroup) ? (ViewGroup) container : null;
++    }
++
++    private static HeadlessOverlay findOverlay(WebContents webContents) {
++        ViewGroup container = getContainer(webContents);
++        if (container == null) return null;
++        for (int i = 0; i < container.getChildCount(); i++) {
++            View child = container.getChildAt(i);
++            if (child instanceof HeadlessOverlay) {
++                return (HeadlessOverlay) child;
++            }
++        }
++        return null;
++    }
++
++    private static void applyVisibility(WebContents webContents, boolean visible) {
++        ViewGroup container = getContainer(webContents);
++        if (container == null) return;
++
++        HeadlessOverlay overlay = findOverlay(webContents);
++        if (visible) {
++            if (overlay != null) overlay.setVisibility(View.GONE);
++            return;
++        }
++
++        if (overlay == null) {
++            overlay = new HeadlessOverlay(container.getContext());
++            container.addView(overlay,
++                new ViewGroup.LayoutParams(
++                    ViewGroup.LayoutParams.MATCH_PARENT,
++                    ViewGroup.LayoutParams.MATCH_PARENT));
++        }
++        overlay.setVisibility(View.VISIBLE);
++        overlay.bringToFront();
++    }
++
++    /** Whether contents should start hidden for this session. */
++    @CalledByNative
++    private static boolean isHeadlessModeEnabled() {
++        return sHeadlessAutomationMode.getInstance().isEnabled();
++    }
++}
+diff --git a/chrome/browser/flags/android/java/src/org/chromium/chrome/browser/flags/cromite/sHeadlessAutomationMode.java b/chrome/browser/flags/android/java/src/org/chromium/chrome/browser/flags/cromite/sHeadlessAutomationMode.java
+new file mode 100644
+--- /dev/null
++++ b/chrome/browser/flags/android/java/src/org/chromium/chrome/browser/flags/cromite/sHeadlessAutomationMode.java
+@@ -0,0 +1,33 @@
++/*
++    This file is part of Cromite.
++
++    Cromite is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    Cromite is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with Cromite. If not, see <https://www.gnu.org/licenses/>.
++*/
++
++package org.chromium.chrome.browser.flags.cromite;
++
++import org.chromium.components.cached_flags.CachedFlag;
++import org.chromium.chrome.browser.flags.ChromeFeatureMap;
++
++public class sHeadlessAutomationMode {
++    private static final CachedFlag sInstance =
++        new CachedFlag(ChromeFeatureMap.getInstance(),
++            "HeadlessAutomationMode", false);
++
++    private sHeadlessAutomationMode() {}
++
++    public static CachedFlag getInstance() {
++        return sInstance;
++    }
++}
+diff --git a/cromite_flags/chrome/browser/about_flags_cc/Headless-automation-mode.inc b/cromite_flags/chrome/browser/about_flags_cc/Headless-automation-mode.inc
+new file mode 100644
+--- /dev/null
++++ b/cromite_flags/chrome/browser/about_flags_cc/Headless-automation-mode.inc
+@@ -0,0 +1,13 @@
++#ifdef FLAG_SECTION
++
++#if BUILDFLAG(IS_ANDROID)
++
++    {"headless-automation-mode",
++     "Headless automation mode",
++     "Hides web contents from the user while the renderer keeps running; "
++     "reveal on demand via window.cromite.setContentVisible(true).", kOsAndroid,
++     FEATURE_VALUE_TYPE(features::kHeadlessAutomationMode)},
++
++#endif
++
++#endif
+diff --git a/cromite_flags/content/public/common/content_features_cc/Headless-automation-mode.inc b/cromite_flags/content/public/common/content_features_cc/Headless-automation-mode.inc
+new file mode 100644
+--- /dev/null
++++ b/cromite_flags/content/public/common/content_features_cc/Headless-automation-mode.inc
+@@ -0,0 +1,3 @@
++CROMITE_FEATURE(kHeadlessAutomationMode,
++                "HeadlessAutomationMode",
++                base::FEATURE_DISABLED_BY_DEFAULT);
+diff --git a/cromite_flags/content/public/common/content_features_h/Headless-automation-mode.inc b/cromite_flags/content/public/common/content_features_h/Headless-automation-mode.inc
+new file mode 100644
+--- /dev/null
++++ b/cromite_flags/content/public/common/content_features_h/Headless-automation-mode.inc
+@@ -0,0 +1,1 @@
++CONTENT_EXPORT BASE_DECLARE_FEATURE(kHeadlessAutomationMode);
+--
