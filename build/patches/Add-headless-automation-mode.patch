@@ -2,50 +2,67 @@ From: Cromite <cromite@cromite.org>
 Date: Sat, 31 May 2026 00:00:00 +0000
 Subject: Add headless automation mode
 
-Adds an Android "headless / show-on-demand" automation mode driven by the
-existing cromite test-support DevTools socket (WebDriverIO + Appium).
+Adds an on-device automation harness for Android, layered on the existing
+cromite test-support private API.
 
-When the "headless-automation-mode" cromite flag is enabled, an opaque
-overlay can be placed on top of the web contents so the rendered page is
-hidden from the user while the renderer keeps running (so JavaScript and
-automation continue to work). The overlay is toggled on demand from the
-existing window.cromite private API:
+When the "headless-automation-mode" cromite flag is enabled, a harness UI is
+placed on top of a tab's web contents. The overlay is no longer an opaque black
+view: it is a FrameLayout hosting a WebView that loads the bundled page
+file:///android_asset/cromite_automation/harness.html. The harness owns all
+flow logic in JavaScript (the flow registry, the run loop, and flow
+add/remove/update) and talks to native automation primitives exposed as
+window.automationNative:
 
-    await window.cromite.setContentVisible(false); // hide
-    await window.cromite.setContentVisible(true);  // show
-    await window.cromite.isContentVisible();        // query
+    navigate(url), waitForSelector(sel, timeout), evaluate(js), tap(sel),
+    type(sel, text), scrollTo(sel), sleep(ms), showBrowser(), hideBrowser(),
+    cancel()
 
-The visibility methods are exposed on chrome://version, exactly like the
-other window.cromite test APIs, and reach the Android view layer through a
-small JNI bridge that operates on the WebContents container view (no
-ChromeActivity coupling). Hiding uses an opaque Android View placed above
-the compositor surface rather than detaching the surface, so compositing
-is not suspended.
+Interaction is human-like: JavaScript is used only to locate elements and read
+results, while taps and keystrokes are dispatched as real Android input events
+(MotionEvent / KeyEvent) through the container view, with randomized timing and
+small coordinate jitter, so the renderer sees trusted events through the normal
+input pipeline. The harness UI ships two tabs (a UI-only Chat tab and a Flows
+tab that lists flows with an add button); the renderer keeps compositing while
+the overlay is shown, so automation continues to run while the page is hidden.
 
-This patch builds on Add-cromite-test-support.patch (it extends the
-CromitePrivateApiExtension mojo interface, the browser-process host and
-the renderer binding it introduces) and must be applied after it.
+The previously added window.cromite.setContentVisible / isContentVisible methods
+remain for optional external (WebDriver/Appium) control of the same overlay.
 
-Build note: the new Java class CromiteHeadlessBridge must be registered
-with the chrome generate_jni target in the build environment so that
-chrome/browser can include CromiteHeadlessBridge_jni.h. The exact
-generate_jni "sources" list in the targeted Chromium version is added
-there, not in this patch.
+Build-environment integration (intentionally kept out of the diff, like the
+generate_jni note, because it is version/tree specific):
+  * Register the new Java classes (CromiteHeadlessBridge, AutomationBridge,
+    AutomationEngine) with the chrome generate_jni target so the generated
+    CromiteHeadlessBridge_jni.h is available to chrome/browser.
+  * Add an android_assets() target that bundles
+    chrome/android/java/assets/cromite_automation/harness.html into the APK at
+    assets/cromite_automation/harness.html (mirror
+    Experimental-user-scripts-support.patch).
+  * Call CromiteHeadlessBridge.attachHarness(tab.getWebContents()) from the
+    active-tab / activity init path so the harness is shown on startup when the
+    flag is enabled (re-assert on active-tab change so a new tab cannot leak
+    content).
+  * Confirm the real-input dispatch path (container dispatchTouchEvent /
+    dispatchKeyEvent vs WebContents.getEventForwarder()) for the targeted
+    Chromium version.
 
 License: GPL-3.0-only - https://spdx.org/licenses/GPL-3.0-only.html
 ---
- chrome/common/cromite_private_api_extension.mojom                       |  2 +
- chrome/browser/cromite/cromite_private_api_host.h                       |  2 +
- chrome/browser/cromite/cromite_private_api_host.cc                      | 30 +++
- chrome/renderer/cromite/cromite_private_api_extension.h                 |  4 +
- chrome/renderer/cromite/cromite_private_api_extension.cc                | 74 ++++++++
- chrome/android/java/res/xml/developer_preferences.xml                   |  6 +
- .../chrome/browser/headless/CromiteHeadlessBridge.java                  | 108 +++++++++++
- .../chrome/browser/flags/cromite/sHeadlessAutomationMode.java           | 33 ++++
- .../about_flags_cc/Headless-automation-mode.inc                         | 13 ++
- .../content_features_cc/Headless-automation-mode.inc                    |  3 +
- .../content_features_h/Headless-automation-mode.inc                     |  1 +
- 11 files changed, 276 insertions(+)
+ chrome/common/cromite_private_api_extension.mojom                       |   2 +
+ chrome/browser/cromite/cromite_private_api_host.h                       |   2 +
+ chrome/browser/cromite/cromite_private_api_host.cc                      |  30 +++
+ chrome/renderer/cromite/cromite_private_api_extension.h                 |   4 +
+ chrome/renderer/cromite/cromite_private_api_extension.cc                |  74 ++++++
+ chrome/android/java/res/xml/developer_preferences.xml                   |   6 +
+ .../chrome/browser/headless/CromiteHeadlessBridge.java                  | 152 +++++++++++
+ .../chrome/browser/headless/AutomationBridge.java                       | 136 ++++++++++
+ .../chrome/browser/headless/AutomationEngine.java                       | 204 ++++++++++++++
+ .../java/assets/cromite_automation/harness.html                         | 219 +++++++++++++++
+ .../chrome/browser/flags/cromite/sHeadlessAutomationMode.java           |  33 +++
+ .../about_flags_cc/Headless-automation-mode.inc                         |  13 +
+ .../content_features_cc/Headless-automation-mode.inc                    |   3 +
+ .../content_features_h/Headless-automation-mode.inc                     |   1 +
+ 14 files changed, 879 insertions(+)
+
 
 diff --git a/chrome/common/cromite_private_api_extension.mojom b/chrome/common/cromite_private_api_extension.mojom
 --- a/chrome/common/cromite_private_api_extension.mojom
@@ -251,7 +268,7 @@ diff --git a/chrome/android/java/src/org/chromium/chrome/browser/headless/Cromit
 new file mode 100644
 --- /dev/null
 +++ b/chrome/android/java/src/org/chromium/chrome/browser/headless/CromiteHeadlessBridge.java
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,152 @@
 +/*
 +    This file is part of Cromite.
 +
@@ -271,9 +288,12 @@ new file mode 100644
 +
 +package org.chromium.chrome.browser.headless;
 +
++import android.annotation.SuppressLint;
 +import android.graphics.Color;
 +import android.view.View;
 +import android.view.ViewGroup;
++import android.webkit.WebView;
++import android.widget.FrameLayout;
 +
 +import org.jni_zero.CalledByNative;
 +
@@ -283,25 +303,53 @@ new file mode 100644
 +import org.chromium.ui.base.ViewAndroidDelegate;
 +
 +/**
-+ * Bridges the window.cromite.setContentVisible / isContentVisible private API
-+ * to an opaque overlay placed on top of the WebContents container view. The
-+ * renderer keeps compositing while hidden, so automation continues to work.
++ * Hosts the on-device automation harness on top of a tab's WebContents.
++ *
++ * The overlay is an opaque {@link FrameLayout} containing a {@link WebView} that
++ * loads the bundled harness page (file:///android_asset/cromite_automation/harness.html).
++ * The harness owns all flow logic in JavaScript and talks to the native automation
++ * primitives through the "automationNative" {@link AutomationBridge}.
++ *
++ * Visibility is a simple toggle between the harness (overlay shown) and the live
++ * web contents (overlay gone). The renderer keeps compositing underneath while the
++ * overlay is shown, so automation continues to work.
 + */
 +public class CromiteHeadlessBridge {
-+    /** Opaque marker view so we can find our overlay among the children. */
-+    private static class HeadlessOverlay extends View {
-+        HeadlessOverlay(android.content.Context context) {
-+            super(context);
++    private static final String HARNESS_URL =
++        "file:///android_asset/cromite_automation/harness.html";
++
++    /** Opaque container we can find again among the WebContents container children. */
++    private static class HarnessOverlay extends FrameLayout {
++        final WebView webView;
++        final AutomationBridge bridge;
++
++        @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
++        HarnessOverlay(WebContents webContents) {
++            super(webContents.getViewAndroidDelegate().getContainerView().getContext());
 +            setBackgroundColor(Color.BLACK);
-+            // Automation input is injected through the renderer, not Android
-+            // hit-testing, so the overlay does not need to be click-through.
-+            setClickable(false);
-+            setFocusable(false);
++            setClickable(true);
++            setFocusable(true);
++
++            webView = new WebView(getContext());
++            webView.getSettings().setJavaScriptEnabled(true);
++            webView.getSettings().setDomStorageEnabled(true);
++            webView.getSettings().setAllowFileAccess(true);
++            // The automation engine drives the *tab* WebContents; the bridge marshals
++            // calls onto the UI thread and reports results back into this WebView.
++            bridge = new AutomationBridge(this, webView, webContents);
++            webView.addJavascriptInterface(bridge, "automationNative");
++            webView.loadUrl(HARNESS_URL);
++
++            addView(webView,
++                new FrameLayout.LayoutParams(
++                    ViewGroup.LayoutParams.MATCH_PARENT,
++                    ViewGroup.LayoutParams.MATCH_PARENT));
 +        }
 +    }
 +
 +    private CromiteHeadlessBridge() {}
 +
++    /** Show/hide the live web contents. visible == true reveals the page (overlay GONE). */
 +    @CalledByNative
 +    private static void setContentVisible(WebContents webContents, boolean visible) {
 +        ThreadUtils.runOnUiThread(() -> applyVisibility(webContents, visible));
@@ -309,8 +357,27 @@ new file mode 100644
 +
 +    @CalledByNative
 +    private static boolean isContentVisible(WebContents webContents) {
-+        HeadlessOverlay overlay = findOverlay(webContents);
++        HarnessOverlay overlay = findOverlay(webContents);
 +        return overlay == null || overlay.getVisibility() != View.VISIBLE;
++    }
++
++    /** Whether the harness should be attached for this session. */
++    @CalledByNative
++    private static boolean isHeadlessModeEnabled() {
++        return sHeadlessAutomationMode.getInstance().isEnabled();
++    }
++
++    /**
++     * Attaches (once) the harness overlay to the tab and shows it. Call this from the
++     * tab/activity init path when the flag is enabled. Idempotent per WebContents.
++     */
++    public static void attachHarness(WebContents webContents) {
++        if (!sHeadlessAutomationMode.getInstance().isEnabled()) return;
++        ThreadUtils.runOnUiThread(() -> applyVisibility(webContents, false));
++    }
++
++    static void runOnUiThread(Runnable r) {
++        ThreadUtils.runOnUiThread(r);
 +    }
 +
 +    private static ViewGroup getContainer(WebContents webContents) {
@@ -321,13 +388,13 @@ new file mode 100644
 +        return (container instanceof ViewGroup) ? (ViewGroup) container : null;
 +    }
 +
-+    private static HeadlessOverlay findOverlay(WebContents webContents) {
++    private static HarnessOverlay findOverlay(WebContents webContents) {
 +        ViewGroup container = getContainer(webContents);
 +        if (container == null) return null;
 +        for (int i = 0; i < container.getChildCount(); i++) {
 +            View child = container.getChildAt(i);
-+            if (child instanceof HeadlessOverlay) {
-+                return (HeadlessOverlay) child;
++            if (child instanceof HarnessOverlay) {
++                return (HarnessOverlay) child;
 +            }
 +        }
 +        return null;
@@ -337,14 +404,14 @@ new file mode 100644
 +        ViewGroup container = getContainer(webContents);
 +        if (container == null) return;
 +
-+        HeadlessOverlay overlay = findOverlay(webContents);
++        HarnessOverlay overlay = findOverlay(webContents);
 +        if (visible) {
 +            if (overlay != null) overlay.setVisibility(View.GONE);
 +            return;
 +        }
 +
 +        if (overlay == null) {
-+            overlay = new HeadlessOverlay(container.getContext());
++            overlay = new HarnessOverlay(webContents);
 +            container.addView(overlay,
 +                new ViewGroup.LayoutParams(
 +                    ViewGroup.LayoutParams.MATCH_PARENT,
@@ -352,12 +419,6 @@ new file mode 100644
 +        }
 +        overlay.setVisibility(View.VISIBLE);
 +        overlay.bringToFront();
-+    }
-+
-+    /** Whether contents should start hidden for this session. */
-+    @CalledByNative
-+    private static boolean isHeadlessModeEnabled() {
-+        return sHeadlessAutomationMode.getInstance().isEnabled();
 +    }
 +}
 diff --git a/chrome/browser/flags/android/java/src/org/chromium/chrome/browser/flags/cromite/sHeadlessAutomationMode.java b/chrome/browser/flags/android/java/src/org/chromium/chrome/browser/flags/cromite/sHeadlessAutomationMode.java
@@ -430,4 +491,578 @@ new file mode 100644
 +++ b/cromite_flags/content/public/common/content_features_h/Headless-automation-mode.inc
 @@ -0,0 +1,1 @@
 +CONTENT_EXPORT BASE_DECLARE_FEATURE(kHeadlessAutomationMode);
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/headless/AutomationBridge.java b/chrome/android/java/src/org/chromium/chrome/browser/headless/AutomationBridge.java
+new file mode 100644
+--- /dev/null
++++ b/chrome/android/java/src/org/chromium/chrome/browser/headless/AutomationBridge.java
+@@ -0,0 +1,136 @@
++/*
++    This file is part of Cromite.
++
++    Cromite is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    Cromite is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with Cromite. If not, see <https://www.gnu.org/licenses/>.
++*/
++
++package org.chromium.chrome.browser.headless;
++
++import android.view.View;
++import android.webkit.JavascriptInterface;
++import android.webkit.WebView;
++
++import org.chromium.base.ThreadUtils;
++import org.chromium.content_public.browser.WebContents;
++
++import org.json.JSONObject;
++
++/**
++ * Low-level automation primitives exposed to the harness page as "automationNative".
++ *
++ * Philosophy: keep logic in JavaScript (harness.html owns flows, the run loop, and
++ * flow CRUD). This bridge only offers granular, human-like primitives that drive the
++ * *tab* WebContents and report results back to the harness.
++ *
++ * Threading: @JavascriptInterface methods run on a WebView binder thread; everything
++ * is marshalled to the UI thread. Each call carries a numeric callback id; the result
++ * is delivered back into the harness via window.__automationResolve(id, jsonOrValue).
++ */
++public class AutomationBridge {
++    private final View mOverlay;
++    private final WebView mHarnessWebView;
++    private final WebContents mTab;
++    private final AutomationEngine mEngine;
++
++    AutomationBridge(View overlay, WebView harnessWebView, WebContents tab) {
++        mOverlay = overlay;
++        mHarnessWebView = harnessWebView;
++        mTab = tab;
++        mEngine = new AutomationEngine(tab);
++    }
++
++    // ---- visibility: the harness "Show browser" / "Show progress" controls -------------
++
++    @JavascriptInterface
++    public void showBrowser() {
++        ThreadUtils.runOnUiThread(() -> mOverlay.setVisibility(View.GONE));
++    }
++
++    @JavascriptInterface
++    public void hideBrowser() {
++        ThreadUtils.runOnUiThread(() -> {
++            mOverlay.setVisibility(View.VISIBLE);
++            mOverlay.bringToFront();
++        });
++    }
++
++    // ---- primitives (logic stays in the harness; these are the building blocks) --------
++
++    @JavascriptInterface
++    public void navigate(String url, int id) {
++        ThreadUtils.runOnUiThread(() -> mEngine.navigate(url, ok -> resolveBool(id, ok)));
++    }
++
++    @JavascriptInterface
++    public void waitForSelector(String selector, int timeoutMs, int id) {
++        ThreadUtils.runOnUiThread(
++            () -> mEngine.waitForSelector(selector, timeoutMs, found -> resolveBool(id, found)));
++    }
++
++    @JavascriptInterface
++    public void evaluate(String js, int id) {
++        ThreadUtils.runOnUiThread(() -> mEngine.evaluate(js, json -> resolveRaw(id, json)));
++    }
++
++    @JavascriptInterface
++    public void tap(String selector, int id) {
++        ThreadUtils.runOnUiThread(() -> mEngine.tap(selector, ok -> resolveBool(id, ok)));
++    }
++
++    @JavascriptInterface
++    public void type(String selector, String text, int id) {
++        ThreadUtils.runOnUiThread(() -> mEngine.type(selector, text, ok -> resolveBool(id, ok)));
++    }
++
++    @JavascriptInterface
++    public void scrollTo(String selector, int id) {
++        ThreadUtils.runOnUiThread(() -> mEngine.scrollTo(selector, ok -> resolveBool(id, ok)));
++    }
++
++    @JavascriptInterface
++    public void sleep(int ms, int id) {
++        mHarnessWebView.postDelayed(() -> resolveBool(id, true), ms);
++    }
++
++    @JavascriptInterface
++    public void cancel() {
++        ThreadUtils.runOnUiThread(mEngine::cancel);
++    }
++
++    // ---- result plumbing ---------------------------------------------------------------
++
++    private void resolveBool(int id, boolean value) {
++        resolveRaw(id, value ? "true" : "false");
++    }
++
++    /** json must be a valid JS literal (true/false/number/quoted string/JSON object). */
++    private void resolveRaw(int id, String jsonLiteral) {
++        final String literal = jsonLiteral == null ? "null" : jsonLiteral;
++        ThreadUtils.runOnUiThread(() -> {
++            String call = "window.__automationResolve && window.__automationResolve("
++                + id + "," + literal + ");";
++            mHarnessWebView.evaluateJavascript(call, null);
++        });
++    }
++
++    /** Helper for engine→harness events (status/progress/failure). */
++    void emit(String event, JSONObject payload) {
++        final String json = payload == null ? "null" : payload.toString();
++        ThreadUtils.runOnUiThread(() -> {
++            String call = "window.automation && window.automation." + event
++                + " && window.automation." + event + "(" + json + ");";
++            mHarnessWebView.evaluateJavascript(call, null);
++        });
++    }
++}
+diff --git a/chrome/android/java/src/org/chromium/chrome/browser/headless/AutomationEngine.java b/chrome/android/java/src/org/chromium/chrome/browser/headless/AutomationEngine.java
+new file mode 100644
+--- /dev/null
++++ b/chrome/android/java/src/org/chromium/chrome/browser/headless/AutomationEngine.java
+@@ -0,0 +1,204 @@
++/*
++    This file is part of Cromite.
++
++    Cromite is free software: you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation, either version 3 of the License, or
++    (at your option) any later version.
++
++    Cromite is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with Cromite. If not, see <https://www.gnu.org/licenses/>.
++*/
++
++package org.chromium.chrome.browser.headless;
++
++import android.os.Handler;
++import android.os.Looper;
++import android.os.SystemClock;
++import android.view.KeyCharacterMap;
++import android.view.KeyEvent;
++import android.view.MotionEvent;
++import android.view.View;
++import android.view.ViewGroup;
++
++import org.chromium.content_public.browser.JavaScriptCallback;
++import org.chromium.content_public.browser.LoadUrlParams;
++import org.chromium.content_public.browser.WebContents;
++import org.chromium.ui.base.ViewAndroidDelegate;
++
++import org.json.JSONObject;
++
++import java.util.Random;
++
++/**
++ * Implements the automation primitives by driving a tab's WebContents.
++ *
++ * Interaction is deliberately human-like: JavaScript is used only to *locate*
++ * elements and *read* results; the actual taps and keystrokes are real Android
++ * input events (MotionEvent / KeyEvent) dispatched through the container view with
++ * randomized timing and small coordinate jitter, so the renderer sees isTrusted
++ * events through the normal input pipeline.
++ *
++ * Build-integration note: the exact real-input dispatch path (container
++ * dispatchTouchEvent/dispatchKeyEvent vs WebContents.getEventForwarder()) may need to
++ * be confirmed against the targeted Chromium version.
++ */
++public class AutomationEngine {
++    /** Simple async result callbacks (kept tiny on purpose). */
++    public interface BoolCallback { void run(boolean ok); }
++    public interface RawCallback { void run(String jsonResult); }
++
++    private static final KeyCharacterMap KEY_MAP =
++        KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
++
++    private final WebContents mTab;
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++    private final Random mRandom = new Random();
++    private volatile boolean mCancelled;
++
++    AutomationEngine(WebContents tab) {
++        mTab = tab;
++    }
++
++    void cancel() {
++        mCancelled = true;
++        mHandler.removeCallbacksAndMessages(null);
++    }
++
++    void navigate(String url, BoolCallback cb) {
++        if (mTab == null) { cb.run(false); return; }
++        mTab.getNavigationController().loadUrl(new LoadUrlParams(url));
++        cb.run(true);
++    }
++
++    void evaluate(String js, RawCallback cb) {
++        if (mTab == null) { cb.run("null"); return; }
++        mTab.evaluateJavaScript(js, new JavaScriptCallback() {
++            @Override public void handleJavaScriptResult(String jsonResult) {
++                cb.run(jsonResult);
++            }
++        });
++    }
++
++    void waitForSelector(String selector, int timeoutMs, BoolCallback cb) {
++        final long deadline = SystemClock.uptimeMillis() + Math.max(0, timeoutMs);
++        pollSelector(selector, deadline, cb);
++    }
++
++    private void pollSelector(String selector, long deadline, BoolCallback cb) {
++        if (mCancelled) { cb.run(false); return; }
++        evaluate("(function(){return !!document.querySelector(" + jsString(selector) + ");})()",
++            result -> {
++                if ("true".equals(result)) {
++                    cb.run(true);
++                } else if (SystemClock.uptimeMillis() >= deadline) {
++                    cb.run(false);
++                } else {
++                    mHandler.postDelayed(() -> pollSelector(selector, deadline, cb), 120);
++                }
++            });
++    }
++
++    void scrollTo(String selector, BoolCallback cb) {
++        evaluate("(function(){var e=document.querySelector(" + jsString(selector)
++                + ");if(!e)return false;e.scrollIntoView({block:'center'});return true;})()",
++            result -> cb.run("true".equals(result)));
++    }
++
++    /** Locate the element, then dispatch a real tap at its center (with jitter). */
++    void tap(String selector, BoolCallback cb) {
++        locateCenter(selector, point -> {
++            if (point == null) { cb.run(false); return; }
++            dispatchTap(point[0], point[1]);
++            cb.run(true);
++        });
++    }
++
++    /** Focus the element, then type each character as a real key event. */
++    void type(String selector, String text, BoolCallback cb) {
++        evaluate("(function(){var e=document.querySelector(" + jsString(selector)
++                + ");if(!e)return false;e.focus();return true;})()",
++            result -> {
++                if (!"true".equals(result)) { cb.run(false); return; }
++                typeNext(text, 0, cb);
++            });
++    }
++
++    private void typeNext(String text, int index, BoolCallback cb) {
++        if (mCancelled) { cb.run(false); return; }
++        if (index >= text.length()) { cb.run(true); return; }
++        View container = getContainer();
++        if (container == null) { cb.run(false); return; }
++        KeyEvent[] events = KEY_MAP.getEvents(new char[] { text.charAt(index) });
++        if (events != null) {
++            for (KeyEvent ev : events) container.dispatchKeyEvent(ev);
++        }
++        // Human-like inter-keystroke delay: 60-180ms with occasional longer pauses.
++        int delay = 60 + mRandom.nextInt(120) + (mRandom.nextInt(12) == 0 ? 250 : 0);
++        mHandler.postDelayed(() -> typeNext(text, index + 1, cb), delay);
++    }
++
++    // ---- real input helpers ------------------------------------------------------------
++
++    /** Resolve a selector to a tap point in the container view's local coordinates. */
++    private void locateCenter(String selector, LocateCallback cb) {
++        final View container = getContainer();
++        if (container == null) { cb.run(null); return; }
++        evaluate("(function(){var e=document.querySelector(" + jsString(selector)
++                + ");if(!e)return null;var r=e.getBoundingClientRect();"
++                + "return {x:r.left+r.width/2,y:r.top+r.height/2,"
++                + "iw:window.innerWidth,ih:window.innerHeight};})()",
++            result -> {
++                try {
++                    if (result == null || "null".equals(result)) { cb.run(null); return; }
++                    JSONObject o = new JSONObject(result);
++                    double iw = o.optDouble("iw", 0), ih = o.optDouble("ih", 0);
++                    if (iw <= 0 || ih <= 0) { cb.run(null); return; }
++                    float scaleX = container.getWidth() / (float) iw;
++                    float scaleY = container.getHeight() / (float) ih;
++                    float x = (float) (o.getDouble("x") * scaleX);
++                    float y = (float) (o.getDouble("y") * scaleY);
++                    cb.run(new float[] { x, y });
++                } catch (Exception e) {
++                    cb.run(null);
++                }
++            });
++    }
++
++    private interface LocateCallback { void run(float[] point); }
++
++    private void dispatchTap(float x, float y) {
++        View container = getContainer();
++        if (container == null) return;
++        float jx = x + (mRandom.nextFloat() - 0.5f) * 6f;
++        float jy = y + (mRandom.nextFloat() - 0.5f) * 6f;
++        long down = SystemClock.uptimeMillis();
++        MotionEvent ev = MotionEvent.obtain(down, down, MotionEvent.ACTION_DOWN, jx, jy, 0);
++        container.dispatchTouchEvent(ev);
++        ev.recycle();
++        int dwell = 40 + mRandom.nextInt(80);
++        long up = down + dwell;
++        MotionEvent upEv = MotionEvent.obtain(down, up, MotionEvent.ACTION_UP, jx, jy, 0);
++        mHandler.postDelayed(() -> {
++            container.dispatchTouchEvent(upEv);
++            upEv.recycle();
++        }, dwell);
++    }
++
++    private View getContainer() {
++        if (mTab == null) return null;
++        ViewAndroidDelegate delegate = mTab.getViewAndroidDelegate();
++        if (delegate == null) return null;
++        View v = delegate.getContainerView();
++        return (v instanceof ViewGroup) ? v : v;
++    }
++
++    private static String jsString(String s) {
++        return JSONObject.quote(s == null ? "" : s);
++    }
++}
+diff --git a/chrome/android/java/assets/cromite_automation/harness.html b/chrome/android/java/assets/cromite_automation/harness.html
+new file mode 100644
+--- /dev/null
++++ b/chrome/android/java/assets/cromite_automation/harness.html
+@@ -0,0 +1,219 @@
++<!DOCTYPE html>
++<!--
++    This file is part of Cromite.
++
++    Cromite is free software: you can redistribute it and/or modify it under the
++    terms of the GNU General Public License as published by the Free Software
++    Foundation, either version 3 of the License, or (at your option) any later
++    version. See <https://www.gnu.org/licenses/>.
++
++    This is the on-device automation harness UI. It owns all flow logic in JS;
++    the native side only exposes low-level primitives via window.automationNative.
++-->
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
++<title>Cromite Automation</title>
++<style>
++  :root { color-scheme: dark; }
++  * { box-sizing: border-box; }
++  html, body { margin: 0; height: 100%; background: #0d0d0f; color: #e8e8ea;
++    font-family: system-ui, sans-serif; }
++  body { display: flex; flex-direction: column; }
++  header { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
++    border-bottom: 1px solid #232327; }
++  header .title { font-weight: 600; font-size: 15px; flex: 1; }
++  button { background: #1d1d22; color: #e8e8ea; border: 1px solid #34343a;
++    border-radius: 8px; padding: 8px 12px; font-size: 14px; }
++  button:active { background: #2a2a31; }
++  .tabs { display: flex; border-bottom: 1px solid #232327; }
++  .tabs button { flex: 1; border: 0; border-radius: 0; background: transparent;
++    padding: 12px; color: #9a9aa2; }
++  .tabs button.active { color: #e8e8ea; box-shadow: inset 0 -2px 0 #6c8cff; }
++  main { flex: 1; overflow: auto; }
++  .panel { display: none; height: 100%; flex-direction: column; }
++  .panel.active { display: flex; }
++  /* Chat tab (UI only, no behavior yet) */
++  .messages { flex: 1; overflow: auto; padding: 12px; display: flex;
++    flex-direction: column; gap: 8px; }
++  .bubble { max-width: 80%; padding: 8px 12px; border-radius: 14px; font-size: 14px; }
++  .bubble.bot { background: #1d1d22; align-self: flex-start; }
++  .bubble.me { background: #2f3ea8; align-self: flex-end; }
++  .composer { display: flex; gap: 8px; padding: 10px; border-top: 1px solid #232327; }
++  .composer input { flex: 1; background: #131318; border: 1px solid #34343a;
++    border-radius: 10px; padding: 10px; color: #e8e8ea; font-size: 14px; }
++  /* Flows tab */
++  .flows-head { display: flex; align-items: center; padding: 10px 12px; gap: 8px; }
++  .flows-head .label { flex: 1; font-weight: 600; }
++  .add-btn { width: 38px; height: 38px; font-size: 22px; line-height: 1; padding: 0;
++    border-radius: 50%; }
++  .flow-list { list-style: none; margin: 0; padding: 0 12px 12px; }
++  .flow-list li { padding: 14px 12px; border: 1px solid #232327; border-radius: 10px;
++    margin-bottom: 8px; }
++  .flow-list .empty { color: #7a7a82; text-align: center; padding: 28px 12px; }
++  #status { font-size: 12px; color: #9a9aa2; padding: 6px 12px;
++    border-top: 1px solid #232327; min-height: 24px; }
++  #failure { display: none; background: #3a1d1d; color: #ffd7d7; padding: 10px 12px;
++    font-size: 13px; }
++  #failure.show { display: block; }
++</style>
++</head>
++<body>
++  <header>
++    <span class="title">Automation</span>
++    <button id="showBrowser">Show browser</button>
++  </header>
++
++  <nav class="tabs">
++    <button id="tab-chat" class="active" data-panel="chat">Chat</button>
++    <button id="tab-flows" data-panel="flows">Flows</button>
++  </nav>
++
++  <main>
++    <section id="panel-chat" class="panel active">
++      <div class="messages">
++        <div class="bubble bot">Hi — I'm your automation assistant. (Chat is UI-only for now.)</div>
++      </div>
++      <div class="composer">
++        <input id="chat-input" placeholder="Message" disabled>
++        <button disabled>Send</button>
++      </div>
++    </section>
++
++    <section id="panel-flows" class="panel">
++      <div class="flows-head">
++        <span class="label">Flows</span>
++        <button id="addFlow" class="add-btn" title="Add flow">+</button>
++      </div>
++      <ul id="flowList" class="flow-list"></ul>
++    </section>
++  </main>
++
++  <div id="failure"></div>
++  <div id="status">Ready.</div>
++
++<script>
++(function () {
++  "use strict";
++
++  // ---- bridge: Promise wrappers over the native primitives -------------------------
++  // Native methods take a trailing numeric id and resolve via window.__automationResolve.
++  var pending = {}, nextId = 1;
++  window.__automationResolve = function (id, value) {
++    var p = pending[id];
++    if (!p) return;
++    delete pending[id];
++    p(value);
++  };
++  function call(method, args) {
++    return new Promise(function (resolve) {
++      var id = nextId++;
++      pending[id] = resolve;
++      try {
++        window.automationNative[method].apply(window.automationNative,
++          (args || []).concat([id]));
++      } catch (e) {
++        delete pending[id];
++        resolve(null);
++      }
++    });
++  }
++  var has = window.automationNative && typeof window.automationNative.navigate === "function";
++
++  // Public automation API used by flows (and the engine→harness event callbacks).
++  window.automation = {
++    navigate:    function (url)        { return call("navigate", [url]); },
++    waitFor:     function (sel, t)     { return call("waitForSelector", [sel, t || 8000]); },
++    evaluate:    function (js)         { return call("evaluate", [js]); },
++    tap:         function (sel)        { return call("tap", [sel]); },
++    type:        function (sel, text)  { return call("type", [sel, text]); },
++    scrollTo:    function (sel)        { return call("scrollTo", [sel]); },
++    sleep:       function (ms)         { return call("sleep", [ms]); },
++    showBrowser: function ()           { if (has) window.automationNative.showBrowser(); },
++    hideBrowser: function ()           { if (has) window.automationNative.hideBrowser(); },
++    cancel:      function ()           { if (has) window.automationNative.cancel(); },
++    // engine -> harness events (called from native):
++    onStatus:    function (p) { setStatus(p && p.text); },
++    onProgress:  function (p) { setStatus(p ? ("Step " + p.step + "/" + p.total) : ""); },
++    onFailure:   function (p) { showFailure(p && p.message); }
++  };
++
++  // ---- flow registry (all logic lives here, in JS) ---------------------------------
++  // A flow: { id, name, run: async function(a){...} } where `a` is window.automation.
++  var flows = [];
++  var Flows = {
++    list:   function () { return flows.slice(); },
++    get:    function (id) { return flows.find(function (f) { return f.id === id; }); },
++    add:    function (flow) {
++      flow.id = flow.id || ("flow-" + Date.now());
++      flows.push(flow); renderFlows(); return flow.id;
++    },
++    update: function (id, patch) {
++      var f = Flows.get(id); if (!f) return false;
++      Object.assign(f, patch); renderFlows(); return true;
++    },
++    remove: function (id) {
++      flows = flows.filter(function (f) { return f.id !== id; });
++      renderFlows(); return true;
++    },
++    run: async function (id) {
++      var f = Flows.get(id); if (!f) return;
++      hideFailure(); setStatus("Running: " + f.name);
++      try { await f.run(window.automation); setStatus("Done: " + f.name); }
++      catch (e) { showFailure(String(e && e.message || e)); }
++    }
++  };
++  window.Flows = Flows; // exposed so flows can be defined/managed externally later.
++
++  // ---- UI ---------------------------------------------------------------------------
++  function setStatus(text) { document.getElementById("status").textContent = text || ""; }
++  function showFailure(msg) {
++    var el = document.getElementById("failure");
++    el.textContent = (msg || "Automation failed.") + "  Tap “Show browser” to finish manually.";
++    el.classList.add("show");
++  }
++  function hideFailure() { document.getElementById("failure").classList.remove("show"); }
++
++  function renderFlows() {
++    var ul = document.getElementById("flowList");
++    ul.innerHTML = "";
++    if (!flows.length) {
++      var li = document.createElement("li");
++      li.className = "empty";
++      li.textContent = "No flows yet. Tap + to add one.";
++      ul.appendChild(li);
++      return;
++    }
++    flows.forEach(function (f) {
++      var li = document.createElement("li");
++      li.textContent = f.name;
++      li.onclick = function () { Flows.run(f.id); };
++      ul.appendChild(li);
++    });
++  }
++
++  document.querySelectorAll(".tabs button").forEach(function (btn) {
++    btn.onclick = function () {
++      document.querySelectorAll(".tabs button").forEach(function (b) {
++        b.classList.toggle("active", b === btn);
++      });
++      document.querySelectorAll(".panel").forEach(function (p) {
++        p.classList.toggle("active", p.id === "panel-" + btn.dataset.panel);
++      });
++    };
++  });
++
++  document.getElementById("showBrowser").onclick = function () { window.automation.showBrowser(); };
++
++  // The add (+) button is intentionally a no-op for now — flow creation through the
++  // harness is not designed yet.
++  document.getElementById("addFlow").onclick = function () {
++    setStatus("Add flow: not implemented yet.");
++  };
++
++  renderFlows();
++})();
++</script>
++</body>
++</html>
 --
